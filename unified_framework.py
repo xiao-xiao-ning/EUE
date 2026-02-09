@@ -182,11 +182,12 @@ class UnifiedMultiViewPipeline:
         model: nn.Module,
         device: str = 'cuda',
         mc_samples: int = 30,
-        trust_epsilon: float = 0.02,
-        importance_threshold: float = 0.2
+        trust_epsilon: float = 0.01,
+        importance_threshold: float = 1e-4
     ):
         self.device = device
         self.mc_samples = mc_samples
+        self.importance_threshold = importance_threshold
         
         # 用MC Dropout包装模型
         self.mc_model = MCDropoutWrapper(model)
@@ -214,7 +215,7 @@ class UnifiedMultiViewPipeline:
         x: torch.Tensor,
         target_class: int,
         compute_trust: bool = True,
-        trust_n_perturbations: int = 5,
+        trust_n_perturbations: int = 10,
         trust_method: str = 'aggregated'  # 'aggregated' or 'perturbation'
     ) -> Dict:
         """
@@ -299,11 +300,13 @@ class UnifiedMultiViewPipeline:
         # 6. 计算Trust
         if compute_trust:
             if trust_method == 'aggregated':
-                # 使用Trust_agg公式（推荐）
-                trust = TrustScore.compute_trust_aggregated_normalized(
+                trust = TrustScore.compute_trust_aggregated(
                     mapped_attributions,
                     mapped_uncertainties,
-                    consistency
+                    consistency,
+                    beta=0.5,
+                    gamma=0.8,
+                    importance_threshold=self.importance_threshold
                 )
             elif trust_method == 'perturbation':
                 # 使用扰动验证方法（计算较慢）
@@ -326,11 +329,17 @@ class UnifiedMultiViewPipeline:
             trust_threshold=0.5
         )
         
+        trusted_importance = TrustScore.compute_trusted_importance(
+            mapped_attributions,
+            trust
+        )
+
         return {
             'attribution_mean': mean_attr,
             'attribution_std': std_attr,
             'consistency': consistency,
             'trust': trust,
+            'trusted_importance': trusted_importance,
             'trust_method': trust_method,
             'categories': categories,
             'views': views,

@@ -277,9 +277,7 @@ class UnifiedExperimentPipeline:
         
         mean_attr = results['attribution_mean']
         trust = results['trust']
-        
-        # Trust-weighted attribution
-        trusted_attr = mean_attr * trust
+        trusted_attr = results.get('trusted_importance', mean_attr * trust)
         
         # Random baseline
         random_attr = np.random.randn(len(mean_attr))

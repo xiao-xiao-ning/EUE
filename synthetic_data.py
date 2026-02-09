@@ -24,7 +24,7 @@ class CausalSpuriousTimeSeriesDataset(Dataset):
         spurious_range=(120, 150),
         noise_std: float = 0.5,
         causal_strength: float = 2.0,
-        spurious_strength: float = 1.5,
+        spurious_strength: float = 0.5,
         spurious_flip_prob: float = 0.3,
         seed: int = 42
     ):

@@ -12,7 +12,12 @@ from unified_framework import MCDropoutWrapper, UnifiedMultiViewPipeline
 
 
 def build_dataloaders(batch_size: int = 64, train_ratio: float = 0.8):
-    dataset = CausalSpuriousTimeSeriesDataset()
+    # 强化伪相关段信号，让模型更容易记住它，从而在后续Trust中被判定为不可靠
+    dataset = CausalSpuriousTimeSeriesDataset(
+        causal_strength=1.5,
+        spurious_strength=3.0,
+        spurious_flip_prob=0.05
+    )
     train_len = int(len(dataset) * train_ratio)
     test_len = len(dataset) - train_len
     train_set, test_set = random_split(dataset, [train_len, test_len])
@@ -72,22 +77,30 @@ def train_model(model: nn.Module, train_loader: DataLoader, device: str = "cpu",
     return model
 
 
-def visualize_results(timesteps, attribution, uncertainty, trust, causal_range, spurious_range):
-    plt.figure(figsize=(12, 6))
-    plt.plot(timesteps, attribution, label="Attribution", linewidth=2)
-    plt.plot(timesteps, uncertainty, label="Uncertainty", linewidth=2)
-    plt.plot(timesteps, trust, label="Trust", linewidth=2)
+def visualize_results(timesteps, attribution, uncertainty, trust, consistency, causal_range, spurious_range):
+    fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    plt.axvspan(causal_range[0], causal_range[1], color="green", alpha=0.1, label="Causal Range")
-    plt.axvspan(spurious_range[0], spurious_range[1], color="red", alpha=0.1, label="Spurious Range")
+    ax1.plot(timesteps, attribution, label="Attribution", linewidth=2)
+    ax1.plot(timesteps, trust, label="Trust", linewidth=2)
+    ax1.plot(timesteps, consistency, label="Consistency", linewidth=2, linestyle=":")
+    ax1.plot(
+        timesteps,
+        uncertainty,
+        label="Uncertainty",
+        linewidth=2,
+        color="tab:orange",
+        linestyle="--"
+    )
+    ax1.axvspan(causal_range[0], causal_range[1], color="green", alpha=0.1, label="Causal Range")
+    ax1.axvspan(spurious_range[0], spurious_range[1], color="red", alpha=0.1, label="Spurious Range")
+    ax1.set_xlabel("Timestep")
+    ax1.set_ylabel("Attribution / Trust / Consistency / Uncertainty")
+    ax1.legend()
 
-    plt.xlabel("Timestep")
-    plt.ylabel("Score")
+    ax1.grid(alpha=0.3)
     plt.title("Attribution vs Uncertainty vs Trust")
-    plt.legend()
-    plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("unified_results/synthetic_cnn_results.png")
 
 
 def main():
@@ -101,12 +114,19 @@ def main():
     sample_x = sample_x.to(device)
     sample_y = sample_y.item()
 
-    pipeline = UnifiedMultiViewPipeline(model, device=device, mc_samples=20,trust_epsilon=0.01, importance_threshold=0.2)
+    pipeline = UnifiedMultiViewPipeline(
+        model,
+        device=device,
+        mc_samples=20,
+        trust_epsilon=0.08,
+        importance_threshold=0.2
+    )
     results = pipeline.compute_complete_explanation(
         sample_x,
         sample_y,
         compute_trust=True,
-        trust_n_perturbations=10
+        trust_n_perturbations=10,
+        trust_method='aggregated'
     )
     mapped = {
         k: (v - v.mean()) / (v.std() + 1e-8)
@@ -123,6 +143,7 @@ def main():
         results["attribution_mean"],
         results["attribution_std"],
         results["trust"],
+        results["consistency"],
         dataset.causal_range,
         dataset.spurious_range
     )
