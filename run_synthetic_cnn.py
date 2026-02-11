@@ -3,14 +3,17 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 from tqdm import tqdm
 
+from typing import Optional
+
 from synthetic_data import CausalSpuriousTimeSeriesDataset
-from unified_framework import MCDropoutWrapper, UnifiedMultiViewPipeline
+from unified_framework import UnifiedMultiViewPipeline
 
 
 def build_dataloaders(batch_size: int = 64, train_ratio: float = 0.8):
@@ -28,6 +31,208 @@ def build_dataloaders(batch_size: int = 64, train_ratio: float = 0.8):
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
     return dataset, train_loader, test_loader
+
+
+def perturb_timeseries(x: torch.Tensor, noise_std: float = 0.01) -> torch.Tensor:
+    """Apply small, semantic-neutral Gaussian noise."""
+    base = x.std()
+    base_val = base.item() if torch.isfinite(base).item() else 0.0
+    scale = base_val if base_val > 0 else 1.0
+    noise = torch.randn_like(x) * noise_std * scale
+    return x + noise
+
+
+def predict_label(model: nn.Module, x: torch.Tensor) -> tuple[int, float]:
+    with torch.no_grad():
+        logits = model(x)
+    probs = F.softmax(logits, dim=-1)
+    conf, pred = torch.max(probs, dim=-1)
+    return pred.item(), conf.item()
+
+
+def explanation_topk_overlap(e0, e1, topk_ratio: float = 0.1) -> float:
+    e0 = np.asarray(e0).flatten()
+    e1 = np.asarray(e1).flatten()
+    length = min(len(e0), len(e1))
+    if length == 0:
+        return 0.0
+    k = max(1, int(length * topk_ratio))
+    idx0 = np.argpartition(np.abs(e0), -k)[-k:]
+    idx1 = np.argpartition(np.abs(e1), -k)[-k:]
+    set0 = set(idx0.tolist())
+    set1 = set(idx1.tolist())
+    union = len(set0 | set1)
+    if union == 0:
+        return 0.0
+    return len(set0 & set1) / union
+
+
+def classify_behavior(pred_same: bool, overlap: float, trust_delta: float, overlap_thresh: float = 0.5) -> dict:
+    expl_stable = overlap > overlap_thresh
+    case_label = (
+        'pred_stable_expl_stable' if pred_same and expl_stable else
+        'pred_stable_expl_unstable' if pred_same and not expl_stable else
+        'pred_unstable_expl_stable' if (not pred_same) and expl_stable else
+        'pred_unstable_expl_unstable'
+    )
+    return {
+        'pred_same': pred_same,
+        'expl_stable': expl_stable,
+        'trust_change': trust_delta,
+        'case_label': case_label
+    }
+
+
+def evaluate_with_perturbation(
+    pipeline: UnifiedMultiViewPipeline,
+    model: nn.Module,
+    x: torch.Tensor,
+    noise_std: float = 0.01,
+    topk_ratio: float = 0.1,
+    trust_kwargs: Optional[dict] = None
+) -> dict:
+    trust_kwargs = trust_kwargs or {}
+
+    y0, conf0 = predict_label(model, x)
+    original = pipeline.compute_complete_explanation(
+        x,
+        y0,
+        compute_trust=True,
+        **trust_kwargs
+    )
+
+    x_pert = perturb_timeseries(x, noise_std=noise_std)
+    y1, conf1 = predict_label(model, x_pert)
+    perturbed = pipeline.compute_complete_explanation(
+        x_pert,
+        y1,
+        compute_trust=True,
+        **trust_kwargs
+    )
+
+    overlap = explanation_topk_overlap(
+        original['attribution_mean'],
+        perturbed['attribution_mean'],
+        topk_ratio=topk_ratio
+    )
+    t0_mean = float(np.mean(original['trust']))
+    t1_mean = float(np.mean(perturbed['trust']))
+
+    return {
+        'y0': y0,
+        'y1': y1,
+        'conf0': conf0,
+        'conf1': conf1,
+        't0_mean': t0_mean,
+        't1_mean': t1_mean,
+        'trust_delta': t1_mean - t0_mean,
+        'overlap': overlap
+    }
+
+
+def run_trust_perturbation_protocol(
+    pipeline: UnifiedMultiViewPipeline,
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: str,
+    max_samples: int = 128,
+    noise_std: float = 0.01,
+    topk_ratio: float = 0.1,
+    overlap_thresh: float = 0.5,
+    scatter_path: str = "unified_results/trust_overlap_vs_delta.png",
+    case_path: str = "unified_results/trust_case_distribution.png"
+) -> dict:
+    overlaps, trust_deltas = [], []
+    case_storage = {
+        'pred_stable_expl_stable': [],
+        'pred_stable_expl_unstable': [],
+        'pred_unstable_expl_stable': [],
+        'pred_unstable_expl_unstable': []
+    }
+
+    trust_kwargs = {
+        'trust_n_perturbations': 5,
+        'trust_method': 'aggregated'
+    }
+
+    model.eval()
+    processed = 0
+    for x, _ in data_loader:
+        if processed >= max_samples:
+            break
+        x = x.to(device)
+        eval_result = evaluate_with_perturbation(
+            pipeline,
+            model,
+            x,
+            noise_std=noise_std,
+            topk_ratio=topk_ratio,
+            trust_kwargs=trust_kwargs
+        )
+
+        overlaps.append(eval_result['overlap'])
+        trust_deltas.append(eval_result['trust_delta'])
+
+        behavior = classify_behavior(
+            eval_result['y0'] == eval_result['y1'],
+            eval_result['overlap'],
+            eval_result['trust_delta'],
+            overlap_thresh=overlap_thresh
+        )
+        case_storage[behavior['case_label']].append(eval_result['t1_mean'])
+        processed += 1
+
+    if processed == 0:
+        return {
+            'mean_overlap': 0.0,
+            'mean_trust_delta': 0.0,
+            'case_counts': {k: 0 for k in case_storage}
+        }
+
+    if overlaps:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.scatter(overlaps, trust_deltas, alpha=0.7)
+        ax.axhline(0, color='gray', linestyle='--', linewidth=1)
+        ax.set_xlabel('Explanation overlap (top-k)')
+        ax.set_ylabel('Trust Δ (perturbed - original)')
+        ax.set_title('Trust change vs explanation overlap')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(scatter_path, dpi=300)
+        plt.close(fig)
+
+    case_labels = {
+        'pred_stable_expl_stable': 'pred✓ expl✓',
+        'pred_stable_expl_unstable': 'pred✓ expl✗',
+        'pred_unstable_expl_stable': 'pred✗ expl✓',
+        'pred_unstable_expl_unstable': 'pred✗ expl✗'
+    }
+    fig, ax = plt.subplots(figsize=(8, 4))
+    data = []
+    labels = []
+    counts = []
+    for key in case_storage:
+        values = case_storage[key]
+        data.append(values if values else [np.nan])
+        labels.append(case_labels[key])
+        counts.append(len(values))
+    ax.boxplot(data, labels=labels, showmeans=True)
+    ax.set_ylabel('Trust (perturbed sample)')
+    ax.set_title('Trust distributions across consistency cases')
+    ylim = ax.get_ylim()
+    text_y = ylim[1] - 0.05 * (ylim[1] - ylim[0])
+    for idx, count in enumerate(counts, start=1):
+        ax.text(idx, text_y, f"n={count}", ha='center', va='bottom', fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(case_path, dpi=300)
+    plt.close(fig)
+
+    return {
+        'mean_overlap': float(np.nanmean(overlaps)) if overlaps else 0.0,
+        'mean_trust_delta': float(np.nanmean(trust_deltas)) if trust_deltas else 0.0,
+        'case_counts': {k: len(v) for k, v in case_storage.items()}
+    }
 
 
 class SimpleCNN(nn.Module):
@@ -222,7 +427,7 @@ def visualize_batch_summary(metrics: dict, save_path: str):
     axes[1].plot(metrics['recall_attr'], metrics['precision_attr'], label=f'Attribution (AUPR={metrics["aupr_attr"]:.3f})', linewidth=2)
     axes[1].set_xlabel('Recall')
     axes[1].set_ylabel('Precision')
-    axes[1].set_title('Precision-Recall 曲线')
+    axes[1].set_title('Precision-Recall Curve')
     axes[1].legend()
     axes[1].grid(alpha=0.3)
 
@@ -238,6 +443,7 @@ def main():
 
     model = SimpleCNN(length=dataset.length, num_classes=2).to(device)
     model = train_model(model, train_loader, device=device, epochs=5)
+    model.eval()
 
     sample_x, sample_y = next(iter(test_loader))
     sample_x = sample_x.to(device)
@@ -255,8 +461,30 @@ def main():
     for key, value in batch_metrics.items():
         if isinstance(value, tuple):
             print(f"  {key}: mean={value[0]:.4f}, std={value[1]:.4f}")
+        elif hasattr(value, 'shape'):
+            if value.ndim == 0:
+                print(f"  {key}: {float(value):.4f}")
+            elif value.size == 1:
+                print(f"  {key}: {float(value.item()):.4f}")
+            else:
+                print(f"  {key}: {np.array2string(value, precision=4)}")
         else:
             print(f"  {key}: {value:.4f}")
+
+    perturb_stats = run_trust_perturbation_protocol(
+        pipeline,
+        model,
+        test_loader,
+        device=device,
+        max_samples=128,
+        noise_std=0.01,
+        topk_ratio=0.1,
+        overlap_thresh=0.5
+    )
+    print("\nTrust perturbation protocol summary:")
+    print(f"  mean overlap: {perturb_stats['mean_overlap']:.4f}")
+    print(f"  mean trust delta: {perturb_stats['mean_trust_delta']:.4f}")
+    print(f"  case counts: {perturb_stats['case_counts']}")
 
     visualize_batch_summary(batch_metrics, save_path="unified_results/synthetic_batch_summary.png")
 
